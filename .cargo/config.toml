@@ -1,6 +1,6 @@
 [target.'cfg(target_arch = "x86_64")']
 # Require AES-NI on x86-64 by default
-rustflags = ["-C", "target-feature=+aes"]
+rustflags = ["-C", "target-feature=+aes", "-C", "target-cpu=native"]
 
 [target.'cfg(target_arch = "aarch64")']
 # TODO: AES flag is such that we have decent performance on ARMv8, remove once `aes` crate with MSRV bump ships:
