@@ -138,3 +138,6 @@ substrate-prometheus-endpoint = { version = "0.10.0-dev", git = "https://github.
 #  switch to upstream once merged or once similar performance improvements land upstream
 [patch."https://github.com/supranational/blst.git"]
 blst = { git = "https://github.com/subspace/blst", rev = "ab042e18cb3b62e131423380513964e4b2c7b445" }
+
+[patch.crates-io]
+wasm-opt-sys = { git = "https://github.com/brson/wasm-opt-rs.git", rev = "4e9d718" }

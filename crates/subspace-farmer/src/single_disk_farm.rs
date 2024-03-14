@@ -607,6 +607,7 @@ impl Drop for SingleDiskFarm {
 
 impl SingleDiskFarm {
     pub const PLOT_FILE: &'static str = "plot.bin";
+    pub const PLOT_FILE_REMOTE: &'static str = "plot-remote";
     pub const METADATA_FILE: &'static str = "metadata.bin";
     const SUPPORTED_PLOT_VERSION: u8 = 0;
 
@@ -903,37 +904,59 @@ impl SingleDiskFarm {
             Arc::new(AsyncRwLock::new(sectors_metadata))
         };
 
-        #[cfg(not(windows))]
-        let mut plot_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .advise_random_access()
-            .open(directory.join(Self::PLOT_FILE))?;
+        let plot_file_key = crate::convert_to_s3key(&directory.join(Self::PLOT_FILE));
 
-        #[cfg(not(windows))]
-        plot_file.advise_random_access()?;
+        let plot_file = if std::env::var("RANDRW_S3_SERVER").is_ok() {
+            let exist = randrw_s3_client::object_exist(&plot_file_key).await.unwrap();
 
-        #[cfg(windows)]
-        let mut plot_file = UnbufferedIoFileWindows::open(&directory.join(Self::PLOT_FILE))?;
-
-        if plot_file.size()? != plot_file_size {
-            // Allocating the whole file (`set_len` below can create a sparse file, which will cause
-            // writes to fail later)
-            plot_file
-                .preallocate(plot_file_size)
-                .map_err(SingleDiskFarmError::CantPreallocatePlotFile)?;
-            // Truncating file (if necessary)
-            plot_file.set_len(plot_file_size)?;
-
-            // TODO: Hack due to Windows bugs:
-            //  https://learn.microsoft.com/en-us/answers/questions/1608540/getfileinformationbyhandle-followed-by-read-with-f
-            if cfg!(windows) {
-                warn!("Farm was resized, farmer restart is needed for optimal performance!")
+            if !exist {
+                randrw_s3_client::put_zero_object(&plot_file_key, plot_file_size).await.unwrap();
             }
-        }
 
-        let plot_file = Arc::new(plot_file);
+            #[cfg(not(windows))]
+            let plot_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(directory.join(Self::PLOT_FILE_REMOTE))?;
+
+            #[cfg(windows)]
+            let plot_file = UnbufferedIoFileWindows::open(&directory.join(Self::PLOT_FILE_REMOTE))?;
+            Arc::new(plot_file)
+        } else {
+            #[cfg(not(windows))]
+                let mut plot_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .advise_random_access()
+                .open(directory.join(Self::PLOT_FILE))?;
+
+            #[cfg(not(windows))]
+            plot_file.advise_random_access()?;
+
+            #[cfg(windows)]
+            let mut plot_file = UnbufferedIoFileWindows::open(&directory.join(Self::PLOT_FILE))?;
+
+            if plot_file.size()? != plot_file_size {
+                // Allocating the whole file (`set_len` below can create a sparse file, which will cause
+                // writes to fail later)
+                plot_file
+                    .preallocate(plot_file_size)
+                    .map_err(SingleDiskFarmError::CantPreallocatePlotFile)?;
+                // Truncating file (if necessary)
+                plot_file.set_len(plot_file_size)?;
+
+                // TODO: Hack due to Windows bugs:
+                //  https://learn.microsoft.com/en-us/answers/questions/1608540/getfileinformationbyhandle-followed-by-read-with-f
+                if cfg!(windows) {
+                    warn!("Farm was resized, farmer restart is needed for optimal performance!")
+                }
+            }
+
+            let plot_file = Arc::new(plot_file);
+            plot_file
+        };
 
         let piece_cache = DiskPieceCache::open(&directory, cache_capacity)?;
         let plot_cache = DiskPlotCache::new(
@@ -983,6 +1006,7 @@ impl SingleDiskFarm {
             let error_sender = Arc::clone(&error_sender);
             let span = span.clone();
             let global_mutex = Arc::clone(&global_mutex);
+            let plot_file_key = plot_file_key.clone();
 
             move || {
                 let _span_guard = span.enter();
@@ -1008,6 +1032,7 @@ impl SingleDiskFarm {
                     plotting_thread_pool_manager,
                     stop_receiver: stop_receiver.resubscribe(),
                     global_mutex: &global_mutex,
+                    plot_file_key
                 };
 
                 let plotting_fut = async {
@@ -1104,9 +1129,11 @@ impl SingleDiskFarm {
             }
         })?;
 
-        faster_read_sector_record_chunks_mode_barrier.wait().await;
+        let read_sector_record_chunks_mode = if std::env::var("RANDRW_S3_SERVER").is_ok() {
+            ReadSectorRecordChunksMode::ConcurrentChunks
+        } else {
+            faster_read_sector_record_chunks_mode_barrier.wait().await;
 
-        let read_sector_record_chunks_mode = {
             // Error doesn't matter here
             let _permit = faster_read_sector_record_chunks_mode_concurrency
                 .acquire()
@@ -1203,6 +1230,7 @@ impl SingleDiskFarm {
             modifying_sector_index,
             read_sector_record_chunks_mode,
             global_mutex,
+            plot_file_key
         );
 
         let reading_join_handle = tokio::task::spawn_blocking({

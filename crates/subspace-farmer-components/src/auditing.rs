@@ -102,6 +102,98 @@ where
     }))
 }
 
+pub async fn audit_plot_sync_qiniu<'a, Plot>(
+    public_key: &'a PublicKey,
+    global_challenge: &Blake3Hash,
+    solution_range: SolutionRange,
+    plot: &'a Plot,
+    sectors_metadata: &'a [SectorMetadataChecksummed],
+    maybe_sector_being_modified: Option<SectorIndex>,
+) -> Result<Vec<AuditResult<'a, ReadAtOffset<'a, Plot>>>, AuditingError>
+    where
+        Plot: ReadAtSync + 'a,
+{
+    let public_key_hash = public_key.hash();
+
+    // Create auditing info for all sectors
+    let sector_index_list = sectors_metadata
+        .iter()
+        .map(|sector_metadata| {
+            (
+                collect_sector_auditing_details(public_key_hash, global_challenge, sector_metadata),
+                sector_metadata,
+            )
+        })
+        // Read s-buckets of all sectors, map to winning chunks and then to audit results, all in
+        .filter_map(|(sector_auditing_info, sector_metadata)| {
+            if maybe_sector_being_modified == Some(sector_metadata.sector_index) {
+                // Skip sector that is being modified right now
+                return None;
+            }
+
+            if sector_auditing_info.s_bucket_audit_size == 0 {
+                // S-bucket is empty
+                return None;
+            }
+
+            let sector = plot.offset(
+                u64::from(sector_metadata.sector_index)
+                    * sector_size(sector_metadata.pieces_in_sector) as u64,
+            );
+            Some((sector_auditing_info, sector_metadata, sector))
+        })
+        .collect::<Vec<_>>();
+
+    let ranges = sector_index_list.iter()
+        .map(|(sector_auditing_info, _, sector)| {
+            let offset = sector.offset + sector_auditing_info.s_bucket_audit_offset_in_sector;
+
+            (offset, sector_auditing_info.s_bucket_audit_size as u64)
+        })
+        .collect::<Vec<_>>();
+
+    if sector_index_list.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let key: &str = plot.key().unwrap();
+    let parts = match randrw_s3_client::get_object_with_ranges(key, &ranges).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("get_object_with_ranges error: {:?}", e);
+            return Ok(Vec::new());
+        }
+    };
+
+    sector_index_list
+        .into_iter()
+        .zip(parts)
+        .filter_map(|((sector_auditing_info, sector_metadata, sector), parts)| {
+            let s_bucket = parts.data;
+
+            let (winning_chunks, best_solution_distance) = map_winning_chunks(
+                &s_bucket,
+                global_challenge,
+                &sector_auditing_info.sector_slot_challenge,
+                solution_range,
+            )?;
+
+            Some(Ok(AuditResult {
+                sector_index: sector_metadata.sector_index,
+                solution_candidates: SolutionCandidates::new(
+                    public_key,
+                    sector_auditing_info.sector_id,
+                    sector_auditing_info.s_bucket_audit_index,
+                    sector,
+                    sector_metadata,
+                    winning_chunks.into(),
+                ),
+                best_solution_distance,
+            }))
+        })
+        .collect()
+}
+
 /// Audit the whole plot and generate streams of solutions
 pub fn audit_plot_sync<'a, Plot>(
     public_key: &'a PublicKey,

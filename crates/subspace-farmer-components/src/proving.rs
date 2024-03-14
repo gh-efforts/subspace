@@ -77,13 +77,17 @@ impl ProvingError {
 }
 
 #[derive(Debug, Clone)]
-struct WinningChunk {
+pub struct WinningChunk {
     /// Chunk offset within s-bucket
     chunk_offset: u32,
     /// Piece offset in a sector
-    piece_offset: PieceOffset,
+    pub piece_offset: PieceOffset,
     /// Solution distance of this chunk
     solution_distance: SolutionRange,
+    pub record_record_metadata: Option<(
+        Vec<Option<(Vec<u8>, u64, bool)>>,
+        Vec<u8>
+    )>
 }
 
 /// Container for solution candidates.
@@ -95,8 +99,8 @@ where
     public_key: &'a PublicKey,
     sector_id: SectorId,
     s_bucket: SBucket,
-    sector: Sector,
-    sector_metadata: &'a SectorMetadataChecksummed,
+    pub sector: Sector,
+    pub sector_metadata: &'a SectorMetadataChecksummed,
     chunk_candidates: VecDeque<ChunkCandidate>,
 }
 
@@ -148,6 +152,36 @@ where
         self.chunk_candidates.is_empty()
     }
 
+    pub fn into_solutions_qiniu<RewardAddress, PosTable, TableGenerator>(
+        self,
+        reward_address: &'a RewardAddress,
+        kzg: &'a Kzg,
+        erasure_coding: &'a ErasureCoding,
+        mode: ReadSectorRecordChunksMode,
+        table_generator: TableGenerator,
+        sector_contents_map_bytes: Vec<u8>
+    ) -> Result<SolutionsIterator<'a, RewardAddress, PosTable, TableGenerator, Sector>, ProvingError>
+    where
+        RewardAddress: Copy,
+        PosTable: Table,
+        TableGenerator: (FnMut(&PosSeed) -> PosTable) + 'a,
+    {
+        SolutionsIterator::<'a, _, PosTable, _, _>::new_qiniu(
+            self.public_key,
+            reward_address,
+            self.sector_id,
+            self.s_bucket,
+            self.sector,
+            self.sector_metadata,
+            kzg,
+            erasure_coding,
+            self.chunk_candidates,
+            mode,
+            table_generator,
+            sector_contents_map_bytes
+        )
+    }
+
     /// Turn solution candidates into actual solutions
     pub fn into_solutions<RewardAddress, PosTable, TableGenerator>(
         self,
@@ -180,7 +214,7 @@ where
 
 type MaybeSolution<RewardAddress> = Result<Solution<PublicKey, RewardAddress>, ProvingError>;
 
-struct SolutionsIterator<'a, RewardAddress, PosTable, TableGenerator, Sector>
+pub struct SolutionsIterator<'a, RewardAddress, PosTable, TableGenerator, Sector>
 where
     Sector: ReadAtSync + 'a,
     PosTable: Table,
@@ -190,13 +224,13 @@ where
     reward_address: &'a RewardAddress,
     sector_id: SectorId,
     s_bucket: SBucket,
-    sector_metadata: &'a SectorMetadataChecksummed,
-    s_bucket_offsets: Box<[u32; Record::NUM_S_BUCKETS]>,
+    pub sector_metadata: &'a SectorMetadataChecksummed,
+    pub s_bucket_offsets: Box<[u32; Record::NUM_S_BUCKETS]>,
     kzg: &'a Kzg,
     erasure_coding: &'a ErasureCoding,
-    sector_contents_map: SectorContentsMap,
+    pub sector_contents_map: SectorContentsMap,
     sector: ReadAt<Sector, !>,
-    winning_chunks: VecDeque<WinningChunk>,
+    pub winning_chunks: VecDeque<WinningChunk>,
     count: usize,
     best_solution_distance: Option<SolutionRange>,
     mode: ReadSectorRecordChunksMode,
@@ -224,10 +258,13 @@ where
     type Item = MaybeSolution<RewardAddress>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        use crate::reading::{read_sector_record_chunks_qiniu, read_record_metadata_qiniu};
+
         let WinningChunk {
             chunk_offset,
             piece_offset,
             solution_distance: _,
+            mut record_record_metadata
         } = self.winning_chunks.pop_front()?;
 
         self.count -= 1;
@@ -240,18 +277,28 @@ where
         );
 
         let maybe_solution: Result<_, ProvingError> = try {
-            let sector_record_chunks_fut = read_sector_record_chunks(
-                piece_offset,
-                self.sector_metadata.pieces_in_sector,
-                &self.s_bucket_offsets,
-                &self.sector_contents_map,
-                &pos_table,
-                &self.sector,
-                self.mode,
-            );
-            let sector_record_chunks = sector_record_chunks_fut
-                .now_or_never()
-                .expect("Sync reader; qed")?;
+            let sector_record_chunks = match &mut record_record_metadata {
+                None => {
+                    let sector_record_chunks_fut = read_sector_record_chunks(
+                        piece_offset,
+                        self.sector_metadata.pieces_in_sector,
+                        &self.s_bucket_offsets,
+                        &self.sector_contents_map,
+                        &pos_table,
+                        &self.sector,
+                        self.mode,
+                    );
+                    sector_record_chunks_fut
+                        .now_or_never()
+                        .expect("Sync reader; qed")?
+                }
+                Some((record, _record_metadata)) => {
+                    read_sector_record_chunks_qiniu(
+                        &pos_table,
+                        std::mem::take(record)
+                    )?
+                }
+            };
 
             let chunk = sector_record_chunks
                 .get(usize::from(self.s_bucket))
@@ -269,14 +316,21 @@ where
 
             // NOTE: We do not check plot consistency using checksum because it is more
             // expensive and consensus will verify validity of the proof anyway
-            let record_metadata_fut = read_record_metadata(
-                piece_offset,
-                self.sector_metadata.pieces_in_sector,
-                &self.sector,
-            );
-            let record_metadata = record_metadata_fut
-                .now_or_never()
-                .expect("Sync reader; qed")?;
+            let record_metadata = match record_record_metadata {
+                None => {
+                    let record_metadata_fut = read_record_metadata(
+                        piece_offset,
+                        self.sector_metadata.pieces_in_sector,
+                        &self.sector,
+                    );
+                    record_metadata_fut
+                        .now_or_never()
+                        .expect("Sync reader; qed")?
+                }
+                Some((_, record_metadata)) => {
+                    read_record_metadata_qiniu(record_metadata)?
+                }
+            };
 
             let proof_of_space = pos_table.find_proof(self.s_bucket.into()).expect(
                 "Quality exists for this s-bucket, otherwise it wouldn't be a winning chunk; qed",
@@ -342,6 +396,79 @@ where
     TableGenerator: (FnMut(&PosSeed) -> PosTable) + 'a,
 {
     #[allow(clippy::too_many_arguments)]
+    fn new_qiniu(
+        public_key: &'a PublicKey,
+        reward_address: &'a RewardAddress,
+        sector_id: SectorId,
+        s_bucket: SBucket,
+        sector: Sector,
+        sector_metadata: &'a SectorMetadataChecksummed,
+        kzg: &'a Kzg,
+        erasure_coding: &'a ErasureCoding,
+        chunk_candidates: VecDeque<ChunkCandidate>,
+        mode: ReadSectorRecordChunksMode,
+        table_generator: TableGenerator,
+        sector_contents_map_bytes: Vec<u8>
+    ) -> Result<Self, ProvingError> {
+        if erasure_coding.max_shards() < Record::NUM_S_BUCKETS {
+            return Err(ProvingError::InvalidErasureCodingInstance);
+        }
+
+        let sector_contents_map = {
+            SectorContentsMap::from_bytes(
+                &sector_contents_map_bytes,
+                sector_metadata.pieces_in_sector,
+            )?
+        };
+
+        let s_bucket_records = sector_contents_map
+            .iter_s_bucket_records(s_bucket)
+            .expect("S-bucket audit index is guaranteed to be in range; qed")
+            .collect::<Vec<_>>();
+        let winning_chunks = chunk_candidates
+            .into_iter()
+            .filter_map(move |chunk_candidate| {
+                let (piece_offset, encoded_chunk_used) = s_bucket_records
+                    .get(chunk_candidate.chunk_offset as usize)
+                    .expect("Wouldn't be a candidate if wasn't within s-bucket; qed");
+
+                encoded_chunk_used.then_some(WinningChunk {
+                    chunk_offset: chunk_candidate.chunk_offset,
+                    piece_offset: *piece_offset,
+                    solution_distance: chunk_candidate.solution_distance,
+                    record_record_metadata: None
+                })
+            })
+            .collect::<VecDeque<_>>();
+
+        let best_solution_distance = winning_chunks
+            .front()
+            .map(|winning_chunk| winning_chunk.solution_distance);
+
+        let s_bucket_offsets = sector_metadata.s_bucket_offsets();
+
+        let count = winning_chunks.len();
+
+        Ok(Self {
+            public_key,
+            reward_address,
+            sector_id,
+            s_bucket,
+            sector_metadata,
+            s_bucket_offsets,
+            kzg,
+            erasure_coding,
+            sector_contents_map,
+            sector: ReadAt::from_sync(sector),
+            winning_chunks,
+            count,
+            best_solution_distance,
+            mode,
+            table_generator,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         public_key: &'a PublicKey,
         reward_address: &'a RewardAddress,
@@ -386,6 +513,7 @@ where
                     chunk_offset: chunk_candidate.chunk_offset,
                     piece_offset: *piece_offset,
                     solution_distance: chunk_candidate.solution_distance,
+                    record_record_metadata: None
                 })
             })
             .collect::<VecDeque<_>>();

@@ -102,6 +102,84 @@ pub enum ReadSectorRecordChunksMode {
     WholeSector,
 }
 
+/// return: (offset, chunk_location, encoded_chunk_used)
+pub fn read_sector_record_chunks_index(
+    piece_offset: PieceOffset,
+    pieces_in_sector: u16,
+    sector_contents_map: &SectorContentsMap,
+    s_bucket_offsets: &[u32; Record::NUM_S_BUCKETS],
+    sector_offset: u64
+) -> Vec<Option<(u64, u64, bool)>>{
+    sector_contents_map.par_iter_record_chunk_to_plot(piece_offset)
+        .zip(s_bucket_offsets)
+        .map(
+            |(maybe_chunk_details, &s_bucket_offset)| {
+                let (chunk_offset, encoded_chunk_used) = maybe_chunk_details?;
+                let chunk_location = chunk_offset as u64 + u64::from(s_bucket_offset);
+
+                let offset = SectorContentsMap::encoded_size(pieces_in_sector) as u64
+                    + chunk_location * Scalar::FULL_BYTES as u64;
+                Some((offset + sector_offset, chunk_location, encoded_chunk_used))
+            }
+        )
+        .collect::<Vec<_>>()
+}
+
+pub fn read_sector_record_chunks_qiniu<PosTable>(
+    pos_table: &PosTable,
+    record_data: Vec<Option<(Vec<u8>, u64, bool)>>
+) -> Result<Box<[Option<Scalar>; Record::NUM_S_BUCKETS]>, ReadingError>
+    where
+        PosTable: Table,
+{
+    // TODO: Should have been just `::new()`, but https://github.com/rust-lang/rust/issues/53827
+    // SAFETY: Data structure filled with zeroes is a valid invariant
+    let mut record_chunks =
+        unsafe { Box::<[Option<Scalar>; Record::NUM_S_BUCKETS]>::new_zeroed().assume_init() };
+
+    let read_chunks_inputs = record_chunks.iter_mut()
+    .map(|v| Some(v))
+    .collect::<Vec<_>>();
+
+    read_chunks_inputs
+        .into_par_iter()
+        .zip(record_data)
+        .zip(
+            (u16::from(SBucket::ZERO)..=u16::from(SBucket::MAX))
+                .into_par_iter()
+                .map(|v| Some(SBucket::from(v)))
+        )
+        .flatten()
+        .try_for_each(
+            |((maybe_record_chunk, (record_chunk_raw, chunk_location, encoded_chunk_used)), s_bucket)| {
+                let mut record_chunk: [u8; Scalar::FULL_BYTES] = record_chunk_raw.try_into().unwrap();
+
+                // Decode chunk if necessary
+                if encoded_chunk_used {
+                    let proof = pos_table
+                        .find_proof(s_bucket.into())
+                        .expect("encoded_chunk_used implies proof exists for this chunk; qed");
+
+                    record_chunk =
+                        Simd::to_array(Simd::from(record_chunk) ^ Simd::from(proof.hash()));
+                }
+
+                maybe_record_chunk.replace(Scalar::try_from(record_chunk).map_err(
+                    |error| ReadingError::InvalidChunk {
+                        s_bucket,
+                        encoded_chunk_used,
+                        chunk_location,
+                        error,
+                    },
+                )?);
+
+                Ok::<_, ReadingError>(())
+            }
+        )?;
+
+    Ok(record_chunks)
+}
+
 /// Read sector record chunks, only plotted s-buckets are returned (in decoded form).
 ///
 /// NOTE: This is an async function, but it also does CPU-intensive operation internally, while it
@@ -348,6 +426,28 @@ pub fn recover_source_record_chunks(
     Ok(record_chunks)
 }
 
+pub fn read_record_metadata_index(
+    piece_offset: PieceOffset,
+    pieces_in_sector: u16,
+) -> u64 {
+    let sector_metadata_start = SectorContentsMap::encoded_size(pieces_in_sector) as u64
+        + sector_record_chunks_size(pieces_in_sector) as u64;
+
+    let record_metadata_offset =
+        sector_metadata_start + RecordMetadata::encoded_size() as u64 * u64::from(piece_offset);
+
+    record_metadata_offset
+}
+
+pub(crate) fn read_record_metadata_qiniu(
+    record_metadata_bytes: Vec<u8>,
+) -> Result<RecordMetadata, ReadingError> {
+    let record_metadata = RecordMetadata::decode(&mut record_metadata_bytes.as_ref())
+        .expect("Length is correct, contents doesn't have specific structure to it; qed");
+
+    Ok(record_metadata)
+}
+
 /// Read metadata (commitment and witness) for record
 pub(crate) async fn read_record_metadata<S, A>(
     piece_offset: PieceOffset,
@@ -379,6 +479,112 @@ where
         .expect("Length is correct, contents doesn't have specific structure to it; qed");
 
     Ok(record_metadata)
+}
+
+pub async fn read_piece_qiniu<PosTable, S, A>(
+    piece_offset: PieceOffset,
+    sector_id: &SectorId,
+    sector_metadata: &SectorMetadataChecksummed,
+    sector: &ReadAt<S, A>,
+    erasure_coding: &ErasureCoding,
+    table_generator: &mut PosTable::Generator,
+    key: String,
+    read_at_offset: u64,
+) -> Result<Piece, ReadingError>
+where
+    PosTable: Table,
+    S: ReadAtSync,
+    A: ReadAtAsync,
+{
+    use std::collections::VecDeque;
+
+    let pieces_in_sector = sector_metadata.pieces_in_sector;
+
+    let sector_contents_map = {
+        let sector_contents_map_bytes = match sector {
+            ReadAt::Sync(_sector) => {
+                let mut buff = randrw_s3_client::get_object_with_ranges(&key, &[(read_at_offset, SectorContentsMap::encoded_size(pieces_in_sector) as u64)]).await.unwrap();
+                buff.pop().unwrap().data
+            }
+            ReadAt::Async(_sector) => unreachable!()
+        };
+
+        SectorContentsMap::from_bytes(&sector_contents_map_bytes, pieces_in_sector)?
+    };
+
+    let record_offset_list = read_sector_record_chunks_index(
+        piece_offset,
+        pieces_in_sector,
+        &sector_contents_map,
+        &sector_metadata.s_bucket_offsets(),
+        read_at_offset
+    );
+
+    let record_ranges = record_offset_list.iter()
+        .filter(|opt| opt.is_some())
+        .map(|offset| {
+            (offset.unwrap().0, Scalar::FULL_BYTES as u64)
+        })
+        .collect::<Vec<_>>();
+    
+    let mut record_parts = VecDeque::from(randrw_s3_client::get_object_with_ranges(&key, &record_ranges).await.unwrap());
+
+    let record_data_list = record_offset_list.iter()
+    .map(|v| {
+        match v {
+            Some((_offset, chunk_location, encoded_chunk_used)) => record_parts.pop_front().map(|p| (p.data, *chunk_location, *encoded_chunk_used)),
+            None => None
+        }
+    })
+    .collect::<Vec<_>>();
+
+    let sector_record_chunks = read_sector_record_chunks_qiniu(
+        &table_generator.generate(
+            &sector_id.derive_evaluation_seed(piece_offset, sector_metadata.history_size),
+        ),
+        record_data_list
+    )?;
+
+    // Restore source record scalars
+    let record_chunks =
+        recover_source_record_chunks(&sector_record_chunks, piece_offset, erasure_coding)?;
+
+    let record_metadata_offset = read_record_metadata_index(
+        piece_offset,
+        pieces_in_sector
+    );
+
+    let mut record_metdata_part = randrw_s3_client::get_object_with_ranges(&key, &[(record_metadata_offset + read_at_offset, RecordMetadata::encoded_size() as u64)]).await.unwrap();
+    let record_metadata = read_record_metadata_qiniu(record_metdata_part.pop().unwrap().data)?;
+
+    let mut piece = Piece::default();
+
+    piece
+        .record_mut()
+        .iter_mut()
+        .zip(record_chunks)
+        .for_each(|(output, input)| {
+            *output = input.to_bytes();
+        });
+
+    *piece.commitment_mut() = record_metadata.commitment;
+    *piece.witness_mut() = record_metadata.witness;
+
+    // Verify checksum
+    let actual_checksum = blake3_hash(piece.as_ref());
+    if actual_checksum != record_metadata.piece_checksum {
+        debug!(
+            ?sector_id,
+            %piece_offset,
+            actual_checksum = %hex::encode(actual_checksum),
+            expected_checksum = %hex::encode(record_metadata.piece_checksum),
+            "Hash doesn't match, plotted piece is corrupted"
+        );
+
+        return Err(ReadingError::ChecksumMismatch);
+    }
+
+    Ok(piece)
 }
 
 /// Read piece from sector.

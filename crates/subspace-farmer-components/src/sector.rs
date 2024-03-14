@@ -129,7 +129,7 @@ impl SectorMetadataChecksummed {
 
 /// Commitment and witness corresponding to the same record
 #[derive(Debug, Default, Clone, Encode, Decode)]
-pub(crate) struct RecordMetadata {
+pub struct RecordMetadata {
     /// Record commitment
     pub(crate) commitment: RecordCommitment,
     /// Record witness
@@ -139,7 +139,7 @@ pub(crate) struct RecordMetadata {
 }
 
 impl RecordMetadata {
-    pub(crate) const fn encoded_size() -> usize {
+    pub const fn encoded_size() -> usize {
         RecordWitness::SIZE + RecordCommitment::SIZE + mem::size_of::<Blake3Hash>()
     }
 }

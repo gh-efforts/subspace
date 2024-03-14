@@ -44,6 +44,7 @@ impl PieceReader {
         modifying_sector_index: Arc<AsyncRwLock<Option<SectorIndex>>>,
         read_sector_record_chunks_mode: ReadSectorRecordChunksMode,
         global_mutex: Arc<AsyncMutex<()>>,
+        plot_file_key: String,
     ) -> (Self, impl Future<Output = ()>)
     where
         PosTable: Table,
@@ -61,6 +62,7 @@ impl PieceReader {
                 read_piece_receiver,
                 read_sector_record_chunks_mode,
                 global_mutex,
+                plot_file_key,
             )
             .await
         };
@@ -103,6 +105,7 @@ async fn read_pieces<PosTable, S>(
     mut read_piece_receiver: mpsc::Receiver<ReadPieceRequest>,
     mode: ReadSectorRecordChunksMode,
     global_mutex: Arc<AsyncMutex<()>>,
+    plot_file_key: String,
 ) where
     PosTable: Table,
     S: ReadAtSync,
@@ -187,6 +190,8 @@ async fn read_pieces<PosTable, S>(
             &erasure_coding,
             mode,
             &mut table_generator,
+            u64::from(sector_index) * sector_size as u64,
+            plot_file_key.clone(),
         )
         .await;
 
@@ -203,6 +208,8 @@ async fn read_piece<PosTable, S, A>(
     erasure_coding: &ErasureCoding,
     mode: ReadSectorRecordChunksMode,
     table_generator: &mut PosTable::Generator,
+    read_offset: u64,
+    plot_file_key: String,
 ) -> Option<Piece>
 where
     PosTable: Table,
@@ -213,28 +220,56 @@ where
 
     let sector_id = SectorId::new(public_key.hash(), sector_index);
 
-    let piece = match reading::read_piece::<PosTable, _, _>(
-        piece_offset,
-        &sector_id,
-        sector_metadata,
-        sector,
-        erasure_coding,
-        mode,
-        table_generator,
-    )
-    .await
-    {
-        Ok(piece) => piece,
-        Err(error) => {
-            error!(
-                %sector_index,
-                %piece_offset,
-                %error,
-                "Failed to read piece from sector"
-            );
-            return None;
-        }
-    };
-
-    Some(piece)
+    if std::env::var("RANDRW_S3_SERVER").is_ok() {
+        let piece = match reading::read_piece_qiniu::<PosTable, _, _>(
+            piece_offset,
+            &sector_id,
+            sector_metadata,
+            sector,
+            erasure_coding,
+            table_generator,
+            plot_file_key,
+            read_offset,
+        )
+        .await
+        {
+            Ok(piece) => piece,
+            Err(error) => {
+                error!(
+                    %sector_index,
+                    %piece_offset,
+                    %error,
+                    "Failed to read piece from sector"
+                );
+                return None;
+            }
+        };
+    
+        Some(piece)
+    } else {
+        let piece = match reading::read_piece::<PosTable, _, _>(
+            piece_offset,
+            &sector_id,
+            sector_metadata,
+            sector,
+            erasure_coding,
+            mode,
+            table_generator,
+        )
+        .await
+        {
+            Ok(piece) => piece,
+            Err(error) => {
+                error!(
+                    %sector_index,
+                    %piece_offset,
+                    %error,
+                    "Failed to read piece from sector"
+                );
+                return None;
+            }
+        };
+    
+        Some(piece)
+    }
 }

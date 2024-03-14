@@ -88,7 +88,9 @@ impl DiskPlotCache {
             let plotted_size = sector_size * sectors_metadata.len() as u64;
 
             // Avoid writing over large gaps on Windows that is very lengthy process
-            if !cfg!(windows) || (file_size - plotted_size) <= MAX_WINDOWS_PLOT_SPACE_FOR_CACHE {
+            if (!cfg!(windows) || (file_size - plotted_size) <= MAX_WINDOWS_PLOT_SPACE_FOR_CACHE) &&
+                std::env::var("RANDRW_S3_SERVER").is_err()
+            {
                 // Step over all free potential offsets for pieces that could have been cached
                 let from_offset = (plotted_size / Self::element_size() as u64) as u32;
                 let to_offset = (file_size / Self::element_size() as u64) as u32;

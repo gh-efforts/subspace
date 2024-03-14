@@ -118,6 +118,10 @@ pub trait ReadAtSync: Send + Sync {
 
     /// Fill the buffer by reading bytes at a specific offset
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+
+    fn key(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl ReadAtSync for ! {
@@ -251,8 +255,8 @@ impl ReadAtSync for &File {
 /// Reader with fixed offset added to all attempted reads
 #[derive(Debug, Copy, Clone)]
 pub struct ReadAtOffset<'a, T> {
-    inner: &'a T,
-    offset: u64,
+    pub inner: &'a T,
+    pub offset: u64,
 }
 
 impl<T> ReadAtSync for ReadAtOffset<'_, T>

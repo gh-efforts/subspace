@@ -63,6 +63,8 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 ulid = { version = "1.0.0", features = ["serde"] }
 zeroize = "1.7.0"
+randrw-s3-client = { git = "https://github.com/gh-efforts/randrw-s3.git" }
+bytes = "1"
 
 [features]
 default = ["numa"]

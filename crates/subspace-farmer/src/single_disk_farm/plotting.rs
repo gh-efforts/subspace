@@ -170,6 +170,7 @@ pub(super) struct PlottingOptions<'a, NC, PG> {
     pub(super) plotting_thread_pool_manager: PlottingThreadPoolManager,
     pub(super) stop_receiver: broadcast::Receiver<()>,
     pub(super) global_mutex: &'a AsyncMutex<()>,
+    pub(super) plot_file_key: String,
 }
 
 /// Starts plotting process.
@@ -205,6 +206,7 @@ where
         plotting_thread_pool_manager,
         mut stop_receiver,
         global_mutex,
+        plot_file_key
     } = plotting_options;
 
     let abort_early = Arc::new(AtomicBool::new(false));
@@ -458,7 +460,32 @@ where
 
             let start = Instant::now();
 
-            plot_file.write_all_at(&sector, (sector_index as usize * sector_size) as u64)?;
+            if std::env::var("RANDRW_S3_SERVER").is_ok() {
+                const RETRY: u8 = 5;
+                let mut count = 0;
+
+                let sector = bytes::Bytes::from(sector);
+                
+                loop {
+                    let sector = sector.clone();
+                    let res = randrw_s3_client::update_object(&plot_file_key, (sector_index as usize * sector_size) as u64, sector.len() as u64, std::io::Cursor::new(sector)).await;
+
+                    match res {
+                        Ok(_) => break,
+                        Err(e) => {
+                            if count < RETRY {
+                                tracing::error!("update_object error: {:?}; retry", e);
+                            } else {
+                                panic!("update object panic; cause: {:?}", e);
+                            }
+                        }
+                    }
+                    count += 1;
+                }
+            } else {
+                plot_file.write_all_at(&sector, (sector_index as usize * sector_size) as u64)?;
+            }
+            
             metadata_file.write_all_at(
                 &sector_metadata,
                 RESERVED_PLOT_METADATA + (u64::from(sector_index) * sector_metadata_size as u64),

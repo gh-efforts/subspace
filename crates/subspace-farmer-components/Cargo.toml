@@ -40,6 +40,7 @@ subspace-verification = { version = "0.1.0", path = "../subspace-verification" }
 thiserror = "1.0.56"
 tokio = { version = "1.35.1", features = ["macros", "parking_lot", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1.40"
+randrw-s3-client = { git = "https://github.com/gh-efforts/randrw-s3.git" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"

@@ -53,3 +53,22 @@ pub use jsonrpsee;
 pub use node_client::node_rpc_client::NodeRpcClient;
 pub use node_client::{Error as RpcClientError, NodeClient};
 use std::num::NonZeroUsize;
+
+use std::path::Path;
+
+fn convert_to_s3key(path: &Path) -> String {
+    let list = path.to_str().unwrap().split_terminator('/').collect::<Vec<_>>();
+    assert!(list.len() > 0);
+
+    let key = if list.len() == 1 {
+        list[list.len() - 1].to_string()
+    } else {
+        Path::new(list[list.len() - 2])
+            .join(list[list.len() - 1])
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+
+    key
+}

@@ -249,6 +249,173 @@ where
         Self(plot)
     }
 
+    pub async fn audit_qiniu<PosTable>(
+        &'a self,
+        options: PlotAuditOptions<'a, PosTable>,
+    ) -> Result<
+        Vec<(
+            SectorIndex,
+            impl ProvableSolutions<Item = Result<Solution<PublicKey, PublicKey>, ProvingError>> + 'a,
+        )>,
+        AuditingError,
+    >
+        where
+            PosTable: Table,
+    {
+        use std::collections::VecDeque;
+        use subspace_farmer_components::auditing::audit_plot_sync_qiniu;
+        use subspace_farmer_components::sector::RecordMetadata;
+
+        let PlotAuditOptions {
+            public_key,
+            reward_address,
+            slot_info,
+            sectors_metadata,
+            kzg,
+            erasure_coding,
+            maybe_sector_being_modified,
+            read_sector_record_chunks_mode: mode,
+            table_generator,
+        } = options;
+
+        let audit_results = audit_plot_sync_qiniu(
+            public_key,
+            &slot_info.global_challenge,
+            slot_info.voting_solution_range,
+            &self.0,
+            sectors_metadata,
+            maybe_sector_being_modified,
+        ).await?;
+
+        let ranges = audit_results
+            .iter()
+            .map(|res| {
+                let sector = &res.solution_candidates.sector;
+                let metadata = res.solution_candidates.sector_metadata;
+                let offset = sector.offset;
+                (offset, subspace_farmer_components::sector::SectorContentsMap::encoded_size(metadata.pieces_in_sector) as u64)
+            })
+            .collect::<Vec<_>>();
+
+        if audit_results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let key = self.0.key().unwrap();
+        let parts = randrw_s3_client::get_object_with_ranges(key, &ranges).await.unwrap();
+
+        let mut record_index_list = Vec::new();
+        let mut record_metadata_index_list = Vec::new();
+
+        let mut output = audit_results
+            .into_iter()
+            .zip(parts)
+            .filter_map(|(audit_results, part)| {
+                let sector_index = audit_results.sector_index;
+                let sector_offset = audit_results.solution_candidates.sector.offset;
+
+                let sector_solutions = audit_results.solution_candidates.into_solutions_qiniu(
+                    reward_address,
+                    kzg,
+                    erasure_coding,
+                    mode,
+                    |seed: &PosSeed| table_generator.lock().generate_parallel(seed),
+                    part.data
+                );
+
+                let sector_solutions = match sector_solutions {
+                    Ok(solutions) => solutions,
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            %sector_index,
+                            "Failed to turn solution candidates into solutions",
+                        );
+
+                        return None;
+                    }
+                };
+
+                if sector_solutions.len() == 0 {
+                    return None;
+                }
+
+                for chunk in sector_solutions.winning_chunks.iter() {
+                    let record_offset_list = subspace_farmer_components::reading::read_sector_record_chunks_index(
+                        chunk.piece_offset,
+                        sector_solutions.sector_metadata.pieces_in_sector,
+                        &sector_solutions.sector_contents_map,
+                        &sector_solutions.s_bucket_offsets,
+                        sector_offset
+                    );
+
+                    record_index_list.push(record_offset_list);
+
+
+                    let record_metadata_offset = subspace_farmer_components::reading::read_record_metadata_index(
+                        chunk.piece_offset,
+                        sector_solutions.sector_metadata.pieces_in_sector
+                    );
+                    record_metadata_index_list.push(record_metadata_offset + sector_offset);
+                }
+
+                Some((sector_index, sector_solutions))
+            })
+            .collect::<Vec<_>>();
+
+        let mut record_ranges = Vec::new();
+
+        for sector_part in record_index_list.iter() {
+            for index_opt in sector_part {
+                if let Some(index) = index_opt {
+                    record_ranges.push((index.0, subspace_core_primitives::crypto::Scalar::FULL_BYTES as u64));
+                }
+            }
+        }
+
+        let mut record_metadata_ranges = Vec::new();
+
+        for i in record_metadata_index_list.iter() {
+            record_metadata_ranges.push((*i, RecordMetadata::encoded_size() as u64));
+        }
+
+        let mut futs = Vec::new();
+
+        for chunk in record_ranges.chunks(1024) {
+            let fut = async {
+                randrw_s3_client::get_object_with_ranges(key, chunk).await.unwrap()
+            };
+
+            futs.push(fut);
+        }
+
+        let parts_list = futures::future::join_all(futs).await;
+        let mut parts_merge = Vec::new();
+
+        for mut parts in parts_list {
+            parts_merge.append(&mut parts);
+        }
+
+        let mut record_parts = VecDeque::from(parts_merge);
+        let mut record_metadata_parts = VecDeque::from(randrw_s3_client::get_object_with_ranges(key, &record_metadata_ranges).await.unwrap());
+
+        for (_, solutions) in output.iter_mut() {
+            for (chunk, record_indexs) in solutions.winning_chunks.iter_mut().zip(&record_index_list) {
+                let mut record_data_list = Vec::new();
+
+                for index in record_indexs {
+                    match index {
+                        Some((_offset, chunk_location, encoded_chunk_used)) => record_data_list.push(Some((record_parts.pop_front().unwrap().data, *chunk_location, *encoded_chunk_used))),
+                        None => record_data_list.push(None)
+                    }
+                }
+
+                chunk.record_record_metadata = Some((record_data_list, record_metadata_parts.pop_front().unwrap().data));
+            }
+        }
+        Ok(output)
+    }
+
     pub fn audit<PosTable>(
         &'a self,
         options: PlotAuditOptions<'a, PosTable>,
@@ -374,6 +541,8 @@ where
     let table_generator = Arc::new(Mutex::new(PosTable::generator()));
     let span = Span::current();
 
+    let handle = tokio::runtime::Handle::current();
+
     while let Some(slot_info) = slot_info_notifications.next().await {
         let slot = slot_info.slot_number;
 
@@ -393,7 +562,7 @@ where
                 thread_pool.install(|| {
                     let _span_guard = span.enter();
 
-                    plot_audit.audit(PlotAuditOptions::<PosTable> {
+                    let options = PlotAuditOptions::<PosTable> {
                         public_key: &public_key,
                         reward_address: &reward_address,
                         slot_info,
@@ -403,7 +572,28 @@ where
                         maybe_sector_being_modified,
                         read_sector_record_chunks_mode,
                         table_generator: &table_generator,
-                    })
+                    };
+
+                    let out = if std::env::var("RANDRW_S3_SERVER").is_ok() {
+                        let convert = |v| -> Box<dyn Send + ProvableSolutions<Item = Result<Solution<PublicKey, PublicKey>, ProvingError>>> {
+                            Box::new(v)
+                        };
+    
+                        handle.block_on(plot_audit.audit_qiniu(options))?
+                            .into_iter()
+                            .map(|(a, b)| (a, convert(b)))
+                            .collect::<Vec<_>>()
+                    } else {
+                        let convert = |v| -> Box<dyn Send + ProvableSolutions<Item = Result<Solution<PublicKey, PublicKey>, ProvingError>>> {
+                            Box::new(v)
+                        };
+    
+                        plot_audit.audit(options)?
+                            .into_iter()
+                            .map(|(a, b)| (a, convert(b)))
+                            .collect::<Vec<_>>()
+                    };
+                    Result::<_, FarmingError>::Ok(out)
                 })?
             };
 
