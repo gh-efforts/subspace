@@ -4,6 +4,7 @@ pub mod piece_reader;
 pub mod plot_cache;
 mod plotting;
 pub mod unbuffered_io_file_windows;
+mod remote_audit;
 
 use crate::identity::{Identity, IdentityError};
 use crate::node_client::NodeClient;
@@ -2074,6 +2075,10 @@ impl SingleDiskFarm {
         info!("Farm check completed");
 
         Ok(())
+    }
+
+    pub async fn remote_audit_plot_sync(bind_addr: std::net::SocketAddr) -> anyhow::Result<()>{
+        remote_audit::daemon(bind_addr).await
     }
 }
 

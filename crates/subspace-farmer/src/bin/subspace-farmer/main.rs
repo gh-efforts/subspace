@@ -4,6 +4,7 @@ mod commands;
 mod utils;
 
 use clap::Parser;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::{env, fs};
 use subspace_farmer::single_disk_farm::SingleDiskFarm;
@@ -54,6 +55,10 @@ enum Command {
         ///   /path/to/directory
         disk_farms: Vec<PathBuf>,
     },
+    RemoteAuditDaemon {
+        #[arg(short, long, default_value = "0.0.0.0:30011")]
+        bind_addr: SocketAddr
+    }
 }
 
 #[tokio::main]
@@ -129,6 +134,9 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 info!("Done");
             }
+        }
+        Command::RemoteAuditDaemon { bind_addr } => {
+            SingleDiskFarm::remote_audit_plot_sync(bind_addr).await?;
         }
     }
     Ok(())

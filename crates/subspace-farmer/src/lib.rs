@@ -13,7 +13,8 @@
     trait_alias,
     try_blocks,
     type_alias_impl_trait,
-    type_changing_struct_update
+    type_changing_struct_update,
+    lazy_cell
 )]
 
 //! # `subspace-farmer` library implementation overview

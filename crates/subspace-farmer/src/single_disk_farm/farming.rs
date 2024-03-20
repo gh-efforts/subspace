@@ -2,7 +2,7 @@ pub mod rayon_files;
 
 use crate::node_client;
 use crate::node_client::NodeClient;
-use crate::single_disk_farm::Handlers;
+use crate::single_disk_farm::{remote_audit, Handlers};
 use async_lock::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use futures::channel::mpsc;
 use futures::StreamExt;
@@ -278,14 +278,33 @@ where
             table_generator,
         } = options;
 
-        let audit_results = audit_plot_sync_qiniu(
-            public_key,
-            &slot_info.global_challenge,
-            slot_info.voting_solution_range,
-            &self.0,
-            sectors_metadata,
-            maybe_sector_being_modified,
-        ).await?;
+        let audit_results = if std::env::var("REMOTE_AUDIT").is_ok() {
+            let res = remote_audit::call_audit_plot(
+                public_key, 
+                slot_info.global_challenge, 
+                slot_info.voting_solution_range, 
+                &self.0,
+                sectors_metadata, 
+                maybe_sector_being_modified
+            ).await;
+
+            match res {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("call_audit_plot error: {:?}", e);
+                    return Ok(Vec::new());
+                }
+            }
+        } else {
+            audit_plot_sync_qiniu(
+                public_key,
+                &slot_info.global_challenge,
+                slot_info.voting_solution_range,
+                &self.0,
+                sectors_metadata,
+                maybe_sector_being_modified,
+            ).await?
+        };
 
         let ranges = audit_results
             .iter()
@@ -381,7 +400,7 @@ where
 
         let mut futs = Vec::new();
 
-        for chunk in record_ranges.chunks(1024) {
+        for chunk in record_ranges.chunks(512) {
             let fut = async {
                 randrw_s3_client::get_object_with_ranges(key, chunk).await.unwrap()
             };

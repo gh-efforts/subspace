@@ -42,11 +42,11 @@ where
 /// Chunk candidate, contains one or more potentially winning audit chunks (in case chunk itself was
 /// encoded and eligible for claiming a reward)
 #[derive(Debug, Clone)]
-pub(crate) struct ChunkCandidate {
+pub struct ChunkCandidate {
     /// Chunk offset within s-bucket
-    pub(crate) chunk_offset: u32,
+    pub chunk_offset: u32,
     /// Solution distance of this chunk, can be used to prioritize higher quality solutions
-    pub(crate) solution_distance: SolutionRange,
+    pub solution_distance: SolutionRange,
 }
 
 /// Audit a single sector and generate a stream of solutions.

@@ -96,12 +96,12 @@ pub struct SolutionCandidates<'a, Sector>
 where
     Sector: 'a,
 {
-    public_key: &'a PublicKey,
-    sector_id: SectorId,
-    s_bucket: SBucket,
+    pub public_key: &'a PublicKey,
+    pub sector_id: SectorId,
+    pub s_bucket: SBucket,
     pub sector: Sector,
     pub sector_metadata: &'a SectorMetadataChecksummed,
-    chunk_candidates: VecDeque<ChunkCandidate>,
+    pub chunk_candidates: VecDeque<ChunkCandidate>,
 }
 
 impl<'a, Sector> Clone for SolutionCandidates<'a, Sector>
@@ -124,7 +124,7 @@ impl<'a, Sector> SolutionCandidates<'a, Sector>
 where
     Sector: ReadAtSync + 'a,
 {
-    pub(crate) fn new(
+    pub fn new(
         public_key: &'a PublicKey,
         sector_id: SectorId,
         s_bucket: SBucket,
