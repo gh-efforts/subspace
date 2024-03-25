@@ -527,7 +527,25 @@ where
         })
         .collect::<Vec<_>>();
     
-    let mut record_parts = VecDeque::from(randrw_s3_client::get_object_with_ranges(&key, &record_ranges).await.unwrap());
+    let mut futs = Vec::new();
+
+    for chunk in record_ranges.chunks(512) {
+        let fut = async {
+            randrw_s3_client::get_object_with_ranges(&key, chunk).await.unwrap()
+        };
+
+        futs.push(fut);
+    }
+
+    let parts_list = futures::future::join_all(futs).await;
+    let mut parts_merge = Vec::new();
+
+    for mut parts in parts_list {
+        parts_merge.append(&mut parts);
+    }
+
+    let mut record_parts = VecDeque::from(parts_merge);
+   
 
     let record_data_list = record_offset_list.iter()
     .map(|v| {
