@@ -107,7 +107,7 @@ pub async fn audit_plot_sync_qiniu<'a, Plot>(
     global_challenge: &Blake3Hash,
     solution_range: SolutionRange,
     plot: &'a Plot,
-    sectors_metadata: &'a [SectorMetadataChecksummed],
+    sectors_metadata: &[&'a SectorMetadataChecksummed],
     maybe_sector_being_modified: Option<SectorIndex>,
 ) -> Result<Vec<AuditResult<'a, ReadAtOffset<'a, Plot>>>, AuditingError>
     where
@@ -118,7 +118,7 @@ pub async fn audit_plot_sync_qiniu<'a, Plot>(
     // Create auditing info for all sectors
     let sector_index_list = sectors_metadata
         .iter()
-        .map(|sector_metadata| {
+        .map(|&sector_metadata| {
             (
                 collect_sector_auditing_details(public_key_hash, global_challenge, sector_metadata),
                 sector_metadata,

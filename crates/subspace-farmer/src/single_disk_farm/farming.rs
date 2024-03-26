@@ -296,12 +296,16 @@ where
                 }
             }
         } else {
+            let sectors_metadata_ref_list = sectors_metadata.iter()
+            .map(|v| v)
+            .collect::<Vec<_>>();
+
             audit_plot_sync_qiniu(
                 public_key,
                 &slot_info.global_challenge,
                 slot_info.voting_solution_range,
                 &self.0,
-                sectors_metadata,
+                sectors_metadata_ref_list.as_slice(),
                 maybe_sector_being_modified,
             ).await?
         };

@@ -1,3 +1,5 @@
+use std::collections::hash_map::HashMap;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::ops::Deref;
 use std::{io, net::SocketAddr, sync::LazyLock};
@@ -6,6 +8,7 @@ use http::Method;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::Server;
+use subspace_core_primitives::crypto::blake3_hash;
 use subspace_core_primitives::{Blake3Hash, PublicKey, SBucket, SectorId, SectorIndex, SolutionRange};
 use anyhow::Result;
 use anyhow::anyhow;
@@ -34,6 +37,7 @@ struct ReqMsg {
     global_challenge: subspace_core_primitives::Blake3Hash,
     voting_solution_range: subspace_core_primitives::SolutionRange,
     sectors_metadata: Vec<Vec<u8>>,
+    sectors_metadata_hash_set: HashSet<Blake3Hash>,
     maybe_sector_being_modified: Option<subspace_core_primitives::SectorIndex>
 }
 
@@ -48,8 +52,9 @@ struct AuditOut {
 }
 
 #[derive(Clone, bincode::Encode, bincode::Decode)]
-struct ReplyMsg {
-    out_list: Vec<AuditOut>
+enum ReplyMsg {
+    Out(Vec<AuditOut>),
+    Need(Vec<Blake3Hash>)
 }
 
 pub async fn call_audit_plot<'a, Plot>(
@@ -63,81 +68,99 @@ pub async fn call_audit_plot<'a, Plot>(
     where
         Plot: ReadAtSync + 'a,
 {
-    let req = ReqMsg {
-        key: plot.key().unwrap().to_owned(),
-        public_key: public_key.as_ref().try_into().unwrap(),
-        global_challenge,
-        voting_solution_range: solution_range,
-        sectors_metadata: sectors_metadata.iter()
+    let sectors_metadata_data = sectors_metadata.iter()
         .map(|metadata| metadata.encode())
-        .collect::<Vec<_>>(),
-        maybe_sector_being_modified
-    };
-
-    static CLIENT: LazyLock<Client<HttpConnector>> = LazyLock::new(|| hyper::Client::new());
-    static DST: LazyLock<String> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").unwrap());
-
-    let metadata_list_size: usize = req.sectors_metadata.iter()
-    .map(|v| v.len())
-    .sum();
-
-    tracing::info!("metadata_list_size: {}, count: {}", metadata_list_size, req.sectors_metadata.len());
-    let data = bincode::encode_to_vec(req, bincode::config::standard())?;
-    tracing::info!("total data size: {}", data.len());
-
-    let req = Request::builder()
-    .method(Method::POST)
-    .uri(format!("http://{}/auditplot", DST.deref()))
-    .body(Body::from(data))?;
-
-    let resp = CLIENT.request(req).await?;
-    let (parts, body) = resp.into_parts();
-
-    if parts.status != 200 {
-        let bytes = hyper::body::to_bytes(body).await?;
-        let msg = String::from_utf8(bytes.to_vec())?;
-        return Err(anyhow!("HTTP response code: {}, message: {}", parts.status.as_u16(), msg));
-    }
-
-    let body = hyper::body::aggregate(body).await?;
-    let reply: ReplyMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
-
-    let ret = reply.out_list.into_iter()
-    .map(|audit| {
-        let matedata = sectors_metadata.iter()
-        .find(|v| v.sector_index == audit.sector_index)
-        .unwrap();
-
-        let winning_chunks = audit.winning_chunks.into_iter()
-        .map(|(chunk_offset, solution_distance)| {
-            ChunkCandidate {
-                chunk_offset,
-                solution_distance
-            }
-        })
         .collect::<Vec<_>>();
 
-        AuditResult {
-            sector_index: audit.sector_index,
-            solution_candidates: SolutionCandidates::new(
-                public_key,
-                SectorId::new(public_key.hash(), audit.sector_index),
-                SBucket::from(audit.s_bucket),
-                plot.offset(audit.sector_offset),
-                matedata,
-                winning_chunks.into(),
-            ),
-            best_solution_distance: audit.best_solution_distance,
-        }
-    })
-    .collect::<Vec<_>>();
+    let sm_map = sectors_metadata_data.iter()
+    .map(|d| (blake3_hash(d), d))
+    .collect::<HashMap<_, _>>();
 
-    Ok(ret)
+    let mut need_key: Vec<Blake3Hash> = Vec::new();
+
+    loop {
+        let need_data = need_key.iter()
+        .map(|key| sm_map[key].clone())
+        .collect::<Vec<_>>();
+
+        let req = ReqMsg {
+            key: plot.key().unwrap().to_owned(),
+            public_key: public_key.as_ref().try_into().unwrap(),
+            global_challenge,
+            voting_solution_range: solution_range,
+            sectors_metadata: need_data,
+            sectors_metadata_hash_set: sm_map.keys().map(|v| *v).collect(),
+            maybe_sector_being_modified
+        };
+
+        static CLIENT: LazyLock<Client<HttpConnector>> = LazyLock::new(|| hyper::Client::new());
+        static DST: LazyLock<String> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").unwrap());
+
+        let data = bincode::encode_to_vec(req, bincode::config::standard())?;
+
+        let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{}/auditplot", DST.deref()))
+        .body(Body::from(data))?;
+
+        let resp = CLIENT.request(req).await?;
+        let (parts, body) = resp.into_parts();
+
+        if parts.status != 200 {
+            let bytes = hyper::body::to_bytes(body).await?;
+            let msg = String::from_utf8(bytes.to_vec())?;
+            return Err(anyhow!("HTTP response code: {}, message: {}", parts.status.as_u16(), msg));
+        }
+
+        let body = hyper::body::aggregate(body).await?;
+        let reply: ReplyMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
+
+        match reply {
+            ReplyMsg::Out(out_list) => {
+                let ret = out_list.into_iter()
+                .map(|audit| {
+                    let matedata = sectors_metadata.iter()
+                    .find(|v| v.sector_index == audit.sector_index)
+                    .unwrap();
+            
+                    let winning_chunks = audit.winning_chunks.into_iter()
+                    .map(|(chunk_offset, solution_distance)| {
+                        ChunkCandidate {
+                            chunk_offset,
+                            solution_distance
+                        }
+                    })
+                    .collect::<Vec<_>>();
+            
+                    AuditResult {
+                        sector_index: audit.sector_index,
+                        solution_candidates: SolutionCandidates::new(
+                            public_key,
+                            SectorId::new(public_key.hash(), audit.sector_index),
+                            SBucket::from(audit.s_bucket),
+                            plot.offset(audit.sector_offset),
+                            matedata,
+                            winning_chunks.into(),
+                        ),
+                        best_solution_distance: audit.best_solution_distance,
+                    }
+                })
+                .collect::<Vec<_>>();
+            
+                return Ok(ret);
+            }
+            ReplyMsg::Need(need) => {
+                need_key = need;
+            }
+        }
+    }
 }
 
 async fn audit_plot(
     req: Request<Body>,
 ) -> Result<Response<Body>, http::Error> {
+    static METADATA_LIST: LazyLock<tokio::sync::Mutex<HashMap<Blake3Hash, SectorMetadataChecksummed>>> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
     let fut = async {
         tracing::info!("remote audit plot");
         let body = hyper::body::aggregate(req.into_body()).await?;
@@ -147,22 +170,43 @@ async fn audit_plot(
         let pk = PublicKey::from(req.public_key);
         let fake_plot = KeyWrap(req.key);
 
-        let sectors_metadata = req.sectors_metadata.into_iter().map(|s| {
+        let mut md_guard = METADATA_LIST.deref().lock().await;
+
+        for s in req.sectors_metadata {
             let mut input = s.as_slice();
-            SectorMetadataChecksummed::decode(&mut input).unwrap()
-        })
-        .collect::<Vec<_>>();
+            let key = blake3_hash(input);
+            let sm = SectorMetadataChecksummed::decode(&mut input).unwrap();
+
+            md_guard.insert(key, sm);
+        }
         
+        let md_keys = md_guard.keys().map(|v| *v).collect::<HashSet<Blake3Hash>>();
+        let diff = req.sectors_metadata_hash_set.difference(&md_keys)
+        .map(|v| *v)
+        .collect::<Vec<_>>();
+
+        if !diff.is_empty() {
+            let reply = ReplyMsg::Need(diff);
+            let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
+            return Result::<_, anyhow::Error>::Ok(Response::new(Body::from(out)));
+        }
+
+        let mut sm_input = Vec::with_capacity(req.sectors_metadata_hash_set.len());
+
+        for key in &req.sectors_metadata_hash_set {
+            sm_input.push(&md_guard[key]);
+        }
+
         let audit_res_list = audit_plot_sync_qiniu(
             &pk,
             &req.global_challenge,
             req.voting_solution_range,
             &fake_plot,
-            &sectors_metadata,
+            &sm_input,
             req.maybe_sector_being_modified
         ).await?;
-
-        tracing::info!("call obs");
+        
+        tracing::info!("call obs success");
 
         let audit_list = audit_res_list.into_iter()
         .map(|res| {
@@ -178,9 +222,7 @@ async fn audit_plot(
         })
         .collect::<Vec<_>>();
 
-        let reply = ReplyMsg {
-            out_list: audit_list
-        };
+        let reply = ReplyMsg::Out(audit_list);
 
         let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
         Result::<_, anyhow::Error>::Ok(Response::new(Body::from(out)))
