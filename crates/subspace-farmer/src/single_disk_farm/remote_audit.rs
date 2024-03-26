@@ -131,8 +131,10 @@ async fn audit_plot(
     req: Request<Body>,
 ) -> Result<Response<Body>, http::Error> {
     let fut = async {
+        tracing::info!("remote audit plot");
         let body = hyper::body::aggregate(req.into_body()).await?;
         let req: ReqMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
+        tracing::info!("decode req");
 
         let pk = PublicKey::from(req.public_key);
         let fake_plot = KeyWrap(req.key);
@@ -152,6 +154,8 @@ async fn audit_plot(
             req.maybe_sector_being_modified
         ).await?;
 
+        tracing::info!("call obs");
+        
         let audit_list = audit_res_list.into_iter()
         .map(|res| {
             AuditOut {
