@@ -77,10 +77,18 @@ pub async fn call_audit_plot<'a, Plot>(
     static CLIENT: LazyLock<Client<HttpConnector>> = LazyLock::new(|| hyper::Client::new());
     static DST: LazyLock<String> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").unwrap());
 
+    let metadata_list_size: usize = req.sectors_metadata.iter()
+    .map(|v| v.len())
+    .sum();
+
+    tracing::info!("metadata_list_size: {}, count: {}", metadata_list_size, req.sectors_metadata.len());
+    let data = bincode::encode_to_vec(req, bincode::config::standard())?;
+    tracing::info!("total data size: {}", data.len());
+
     let req = Request::builder()
     .method(Method::POST)
     .uri(format!("http://{}/auditplot", DST.deref()))
-    .body(Body::from(bincode::encode_to_vec(req, bincode::config::standard())?))?;
+    .body(Body::from(data))?;
 
     let resp = CLIENT.request(req).await?;
     let (parts, body) = resp.into_parts();
@@ -155,7 +163,7 @@ async fn audit_plot(
         ).await?;
 
         tracing::info!("call obs");
-        
+
         let audit_list = audit_res_list.into_iter()
         .map(|res| {
             AuditOut {
