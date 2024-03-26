@@ -265,7 +265,8 @@ where
         use std::collections::VecDeque;
         use subspace_farmer_components::auditing::audit_plot_sync_qiniu;
         use subspace_farmer_components::sector::RecordMetadata;
-
+        use std::sync::LazyLock;
+        
         let PlotAuditOptions {
             public_key,
             reward_address,
@@ -278,7 +279,9 @@ where
             table_generator,
         } = options;
 
-        let audit_results = if std::env::var("REMOTE_AUDIT").is_ok() {
+        static IS_REMOTE_AUDIT: LazyLock<bool> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").is_ok());
+
+        let audit_results = if *IS_REMOTE_AUDIT {
             let res = remote_audit::call_audit_plot(
                 public_key, 
                 slot_info.global_challenge, 

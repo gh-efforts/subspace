@@ -2,12 +2,14 @@ use std::collections::hash_map::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::{io, net::SocketAddr, sync::LazyLock};
 
 use http::Method;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::Server;
+use rayon::prelude::*;
 use subspace_core_primitives::crypto::blake3_hash;
 use subspace_core_primitives::{Blake3Hash, PublicKey, SBucket, SectorId, SectorIndex, SolutionRange};
 use anyhow::Result;
@@ -68,14 +70,14 @@ pub async fn call_audit_plot<'a, Plot>(
     where
         Plot: ReadAtSync + 'a,
 {
-    let sectors_metadata_data = sectors_metadata.iter()
-        .map(|metadata| metadata.encode())
-        .collect::<Vec<_>>();
-
-    let sm_map = sectors_metadata_data.iter()
-    .map(|d| (blake3_hash(d), d))
-    .collect::<HashMap<_, _>>();
-
+    let sm_map = sectors_metadata.par_iter()
+        .map(|metadata| {
+            let v = metadata.encode();
+            let k = blake3_hash(&v);
+            (k, v)
+        })
+        .collect::<HashMap<_, _>>();
+    
     let mut need_key: Vec<Blake3Hash> = Vec::new();
 
     loop {
@@ -159,18 +161,27 @@ pub async fn call_audit_plot<'a, Plot>(
 async fn audit_plot(
     req: Request<Body>,
 ) -> Result<Response<Body>, http::Error> {
-    static METADATA_LIST: LazyLock<tokio::sync::Mutex<HashMap<Blake3Hash, SectorMetadataChecksummed>>> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+    // file key -> (metadata key -> metadata)
+    static METADATA_LIST: LazyLock<
+        parking_lot::Mutex<
+            HashMap<String, Arc<tokio::sync::Mutex<HashMap<Blake3Hash, SectorMetadataChecksummed>>>>
+        >
+    > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
     let fut = async {
-        tracing::info!("remote audit plot");
         let body = hyper::body::aggregate(req.into_body()).await?;
         let req: ReqMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
-        tracing::info!("decode req");
 
         let pk = PublicKey::from(req.public_key);
-        let fake_plot = KeyWrap(req.key);
+        let fake_plot = KeyWrap(req.key.clone());
 
-        let mut md_guard = METADATA_LIST.deref().lock().await;
+        let md = {
+            let mut guard = METADATA_LIST.deref().lock();
+            let r = (*guard).entry(req.key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())));
+            (*r).clone()
+        };
+
+        let mut md_guard = md.lock().await;
 
         for s in req.sectors_metadata {
             let mut input = s.as_slice();
@@ -191,11 +202,9 @@ async fn audit_plot(
             return Result::<_, anyhow::Error>::Ok(Response::new(Body::from(out)));
         }
 
-        let mut sm_input = Vec::with_capacity(req.sectors_metadata_hash_set.len());
-
-        for key in &req.sectors_metadata_hash_set {
-            sm_input.push(&md_guard[key]);
-        }
+        let sm_input = req.sectors_metadata_hash_set.par_iter()
+        .map(|key| &md_guard[key])
+        .collect::<Vec<_>>();
 
         let audit_res_list = audit_plot_sync_qiniu(
             &pk,
@@ -206,8 +215,6 @@ async fn audit_plot(
             req.maybe_sector_being_modified
         ).await?;
         
-        tracing::info!("call obs success");
-
         let audit_list = audit_res_list.into_iter()
         .map(|res| {
             AuditOut {
@@ -263,6 +270,8 @@ pub async fn daemon(
             }))
         }
     });
+
+    tracing::info!("Listening on http://{}", bind_addr);
 
     Server::bind(&bind_addr)
     .serve(make_service)
