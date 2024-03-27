@@ -1,26 +1,18 @@
 use std::collections::hash_map::HashMap;
 use std::collections::HashSet;
-use std::convert::Infallible;
-use std::io::Read;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{io, net::SocketAddr, sync::LazyLock};
 
-use http::Method;
-use hyper::server::conn::AddrStream;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::Server;
 use rayon::prelude::*;
 use subspace_core_primitives::crypto::blake3_hash;
 use subspace_core_primitives::{Blake3Hash, PublicKey, SBucket, SectorId, SectorIndex, SolutionRange};
 use anyhow::Result;
-use anyhow::anyhow;
-use bytes::Buf;
-use http::Response;
-use hyper::{client::HttpConnector, http, Body, Client, Request};
 use subspace_farmer_components::{auditing::{audit_plot_sync_qiniu, AuditResult, ChunkCandidate}, proving::SolutionCandidates, sector::SectorMetadataChecksummed, ReadAtOffset, ReadAtSync};
 use parity_scale_codec::{Encode, Decode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub struct KeyWrap(pub String);
 
@@ -101,7 +93,6 @@ pub async fn call_audit_plot<'a, Plot>(
             maybe_sector_being_modified
         };
 
-        static CLIENT: LazyLock<Client<HttpConnector>> = LazyLock::new(|| hyper::Client::new());
         static DST: LazyLock<String> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").unwrap());
 
         let data = bincode::encode_to_vec(req, bincode::config::standard())?;
@@ -109,22 +100,15 @@ pub async fn call_audit_plot<'a, Plot>(
         tracing::info!("    encode req data use: {:?}", t.elapsed());
 
         let t = Instant::now();
-        let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("http://{}/auditplot", DST.deref()))
-        .body(Body::from(data))?;
+        let mut stream = tokio::net::TcpStream::connect(DST.deref()).await?;
+        stream.write_u64(data.len() as u64).await?;
+        stream.write_all(&data).await?;
 
-        let resp = CLIENT.request(req).await?;
-        let (parts, body) = resp.into_parts();
+        let reply_len = stream.read_u64().await? as usize;
+        let mut reply_buf = vec![0u8; reply_len];
+        stream.read_exact(&mut reply_buf).await?;
+        let reply: ReplyMsg = bincode::decode_from_slice(&reply_buf, bincode::config::standard())?.0;
 
-        if parts.status != 200 {
-            let bytes = hyper::body::to_bytes(body).await?;
-            let msg = String::from_utf8(bytes.to_vec())?;
-            return Err(anyhow!("HTTP response code: {}, message: {}", parts.status.as_u16(), msg));
-        }
-
-        let body = hyper::body::aggregate(body).await?;
-        let reply: ReplyMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
         tracing::info!("    call remote use: {:?}", t.elapsed());
 
         match reply {
@@ -169,122 +153,97 @@ pub async fn call_audit_plot<'a, Plot>(
 }
 
 async fn audit_plot(
-    req: Request<Body>,
-) -> Result<Response<Body>, http::Error> {
+    mut stream: TcpStream
+) -> Result<()> {
     // file key -> (metadata key -> metadata)
     static METADATA_LIST: LazyLock<
         parking_lot::Mutex<
             HashMap<String, Arc<tokio::sync::Mutex<HashMap<Blake3Hash, SectorMetadataChecksummed>>>>
         >
     > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+    let req_len = stream.read_u64().await? as usize;
+    let mut req_buf = vec![0u8; req_len];
+    stream.read_exact(&mut req_buf).await?;
+    let req: ReqMsg = bincode::decode_from_slice(&req_buf, bincode::config::standard())?.0;
 
-    let fut = async {
-        let body = hyper::body::aggregate(req.into_body()).await?;
-        let req: ReqMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
+    let pk = PublicKey::from(req.public_key);
+    let fake_plot = KeyWrap(req.key.clone());
 
-        let pk = PublicKey::from(req.public_key);
-        let fake_plot = KeyWrap(req.key.clone());
-
-        let md = {
-            let mut guard = METADATA_LIST.deref().lock();
-            let r = (*guard).entry(req.key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())));
-            (*r).clone()
-        };
-
-        let mut md_guard = md.lock().await;
-
-        for s in req.sectors_metadata {
-            let mut input = s.as_slice();
-            let key = blake3_hash(input);
-            let sm = SectorMetadataChecksummed::decode(&mut input).unwrap();
-
-            md_guard.insert(key, sm);
-        }
-        
-        let md_keys = md_guard.keys().map(|v| *v).collect::<HashSet<Blake3Hash>>();
-        let diff = req.sectors_metadata_hash_set.difference(&md_keys)
-        .map(|v| *v)
-        .collect::<Vec<_>>();
-
-        if !diff.is_empty() {
-            let reply = ReplyMsg::Need(diff);
-            let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
-            return Result::<_, anyhow::Error>::Ok(Response::new(Body::from(out)));
-        }
-
-        let sm_input = req.sectors_metadata_hash_set.par_iter()
-        .map(|key| &md_guard[key])
-        .collect::<Vec<_>>();
-
-        let audit_res_list = audit_plot_sync_qiniu(
-            &pk,
-            &req.global_challenge,
-            req.voting_solution_range,
-            &fake_plot,
-            &sm_input,
-            req.maybe_sector_being_modified
-        ).await?;
-        
-        let audit_list = audit_res_list.into_iter()
-        .map(|res| {
-            AuditOut {
-                sector_index: res.sector_index,
-                s_bucket: res.solution_candidates.s_bucket.into(),
-                sector_offset: res.solution_candidates.sector.offset,
-                winning_chunks: res.solution_candidates.chunk_candidates.into_iter()
-                .map(|candidate| (candidate.chunk_offset, candidate.solution_distance))
-                .collect::<Vec<_>>(),
-                best_solution_distance: res.best_solution_distance
-            }
-        })
-        .collect::<Vec<_>>();
-
-        let reply = ReplyMsg::Out(audit_list);
-
-        let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
-        Result::<_, anyhow::Error>::Ok(Response::new(Body::from(out)))
+    let md = {
+        let mut guard = METADATA_LIST.deref().lock();
+        let r = (*guard).entry(req.key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())));
+        (*r).clone()
     };
 
-    match fut.await {
-        Ok(resp) => Ok(resp),
-        Err(e) => {
-            tracing::error!("{}", e);
+    let mut md_guard = md.lock().await;
 
-            Response::builder()
-                .status(500)
-                .body(Body::from(e.to_string()))
-        }
-    }
-}
+    for s in req.sectors_metadata {
+        let mut input = s.as_slice();
+        let key = blake3_hash(input);
+        let sm = SectorMetadataChecksummed::decode(&mut input).unwrap();
 
-async fn router(
-    req: Request<Body>,
-) -> Result<Response<Body>, http::Error> {
-    match req.uri().path() {
-        "/auditplot" => audit_plot(req).await,
-        _ => {
-            Response::builder()
-                .status(404)
-                .body(Body::empty())
-        }
+        md_guard.insert(key, sm);
     }
+    
+    let md_keys = md_guard.keys().map(|v| *v).collect::<HashSet<Blake3Hash>>();
+    let diff = req.sectors_metadata_hash_set.difference(&md_keys)
+    .map(|v| *v)
+    .collect::<Vec<_>>();
+
+    if !diff.is_empty() {
+        let reply = ReplyMsg::Need(diff);
+        let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
+        stream.write_u64(out.len() as u64).await?;
+        stream.write_all(&out).await?;
+        return Ok(());
+    }
+
+    let sm_input = req.sectors_metadata_hash_set.par_iter()
+    .map(|key| &md_guard[key])
+    .collect::<Vec<_>>();
+
+    let audit_res_list = audit_plot_sync_qiniu(
+        &pk,
+        &req.global_challenge,
+        req.voting_solution_range,
+        &fake_plot,
+        &sm_input,
+        req.maybe_sector_being_modified
+    ).await?;
+    
+    let audit_list = audit_res_list.into_iter()
+    .map(|res| {
+        AuditOut {
+            sector_index: res.sector_index,
+            s_bucket: res.solution_candidates.s_bucket.into(),
+            sector_offset: res.solution_candidates.sector.offset,
+            winning_chunks: res.solution_candidates.chunk_candidates.into_iter()
+            .map(|candidate| (candidate.chunk_offset, candidate.solution_distance))
+            .collect::<Vec<_>>(),
+            best_solution_distance: res.best_solution_distance
+        }
+    })
+    .collect::<Vec<_>>();
+
+    let reply = ReplyMsg::Out(audit_list);
+    let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
+    stream.write_u64(out.len() as u64).await?;
+    stream.write_all(&out).await?;
+    Ok(())
 }
 
 pub async fn daemon(
     bind_addr: SocketAddr,
 ) -> Result<()> {
-    let make_service = make_service_fn(move |_addr: &AddrStream| {
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                router(req)
-            }))
-        }
-    });
+    tracing::info!("Listening on {}", bind_addr);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
-    tracing::info!("Listening on http://{}", bind_addr);
-
-    Server::bind(&bind_addr)
-    .serve(make_service)
-    .await
-    .map_err(|e| anyhow!(e))
+    while let Ok((stream, _peer)) = listener.accept().await {
+        tokio::spawn(async move {
+            if let Err(e) = audit_plot(stream).await {
+                tracing::error!("audit plot error: {:?}", e);
+            }
+        });
+    }
+    Ok(())
 }
