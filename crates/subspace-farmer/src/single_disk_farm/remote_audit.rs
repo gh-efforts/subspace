@@ -72,7 +72,7 @@ pub async fn call_audit_plot<'a, Plot>(
             (k, v)
         })
         .collect::<HashMap<_, _>>();
-    tracing::info!("    encode sectors metadata use: {:?}", t.elapsed());
+    tracing::debug!("    encode sectors metadata use: {:?}", t.elapsed());
 
     let mut need_key: Vec<Blake3Hash> = Vec::new();
 
@@ -97,7 +97,7 @@ pub async fn call_audit_plot<'a, Plot>(
 
         let data = bincode::encode_to_vec(req, bincode::config::standard())?;
 
-        tracing::info!("    encode req data use: {:?}", t.elapsed());
+        tracing::debug!("    encode req data use: {:?}", t.elapsed());
 
         let t = Instant::now();
         let mut stream = tokio::net::TcpStream::connect(DST.deref()).await?;
@@ -109,7 +109,7 @@ pub async fn call_audit_plot<'a, Plot>(
         stream.read_exact(&mut reply_buf).await?;
         let reply: ReplyMsg = bincode::decode_from_slice(&reply_buf, bincode::config::standard())?.0;
 
-        tracing::info!("    call remote use: {:?}", t.elapsed());
+        tracing::debug!("    call remote use: {:?}", t.elapsed());
 
         match reply {
             ReplyMsg::Out(out_list) => {
