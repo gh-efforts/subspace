@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{io, net::SocketAddr, sync::LazyLock};
 
-use flate2::read::ZlibDecoder;
 use http::Method;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
@@ -106,17 +105,14 @@ pub async fn call_audit_plot<'a, Plot>(
         static DST: LazyLock<String> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").unwrap());
 
         let data = bincode::encode_to_vec(req, bincode::config::standard())?;
-        let mut buff = Vec::new();
-        flate2::read::ZlibEncoder::new(&mut data.as_slice(), flate2::Compression::best()).read_to_end(&mut buff)?;
 
         tracing::info!("    encode req data use: {:?}", t.elapsed());
-        tracing::info!("    raw data size: {}, after compression: {}", data.len(), buff.len());
 
         let t = Instant::now();
         let req = Request::builder()
         .method(Method::POST)
         .uri(format!("http://{}/auditplot", DST.deref()))
-        .body(Body::from(buff))?;
+        .body(Body::from(data))?;
 
         let resp = CLIENT.request(req).await?;
         let (parts, body) = resp.into_parts();
@@ -128,9 +124,7 @@ pub async fn call_audit_plot<'a, Plot>(
         }
 
         let body = hyper::body::aggregate(body).await?;
-        let mut zlib_reader = ZlibDecoder::new(body.reader());
-
-        let reply: ReplyMsg = bincode::decode_from_std_read(&mut zlib_reader, bincode::config::standard())?;
+        let reply: ReplyMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
         tracing::info!("    call remote use: {:?}", t.elapsed());
 
         match reply {
@@ -186,8 +180,7 @@ async fn audit_plot(
 
     let fut = async {
         let body = hyper::body::aggregate(req.into_body()).await?;
-        let mut zlib_reader = ZlibDecoder::new(body.reader());
-        let req: ReqMsg = bincode::decode_from_std_read(&mut zlib_reader, bincode::config::standard())?;
+        let req: ReqMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
 
         let pk = PublicKey::from(req.public_key);
         let fake_plot = KeyWrap(req.key.clone());
@@ -249,9 +242,7 @@ async fn audit_plot(
         let reply = ReplyMsg::Out(audit_list);
 
         let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
-        let mut buff = Vec::new();
-        flate2::read::ZlibEncoder::new(&mut out.as_slice(), flate2::Compression::best()).read_to_end(&mut buff)?;
-        Result::<_, anyhow::Error>::Ok(Response::new(Body::from(buff)))
+        Result::<_, anyhow::Error>::Ok(Response::new(Body::from(out)))
     };
 
     match fut.await {
