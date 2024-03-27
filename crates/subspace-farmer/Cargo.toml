@@ -67,6 +67,7 @@ randrw-s3-client = { git = "https://github.com/gh-efforts/randrw-s3.git" }
 bytes = "1"
 bincode = { version = "2.0.0-rc.3" }
 hyper = { version = "0.14", features = ["full"] }
+flate2 = "1"
 
 [features]
 default = ["numa"]

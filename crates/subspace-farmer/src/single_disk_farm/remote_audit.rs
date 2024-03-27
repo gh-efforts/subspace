@@ -1,10 +1,13 @@
 use std::collections::hash_map::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::io::Read;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Instant;
 use std::{io, net::SocketAddr, sync::LazyLock};
 
+use flate2::read::ZlibDecoder;
 use http::Method;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
@@ -70,6 +73,7 @@ pub async fn call_audit_plot<'a, Plot>(
     where
         Plot: ReadAtSync + 'a,
 {
+    let t = Instant::now();
     let sm_map = sectors_metadata.par_iter()
         .map(|metadata| {
             let v = metadata.encode();
@@ -77,10 +81,13 @@ pub async fn call_audit_plot<'a, Plot>(
             (k, v)
         })
         .collect::<HashMap<_, _>>();
-    
+    tracing::info!("    encode sectors metadata use: {:?}", t.elapsed());
+
     let mut need_key: Vec<Blake3Hash> = Vec::new();
 
     loop {
+        let t = Instant::now();
+
         let need_data = need_key.iter()
         .map(|key| sm_map[key].clone())
         .collect::<Vec<_>>();
@@ -99,11 +106,17 @@ pub async fn call_audit_plot<'a, Plot>(
         static DST: LazyLock<String> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").unwrap());
 
         let data = bincode::encode_to_vec(req, bincode::config::standard())?;
+        let mut buff = Vec::new();
+        flate2::read::ZlibEncoder::new(&mut data.as_slice(), flate2::Compression::best()).read_to_end(&mut buff)?;
 
+        tracing::info!("    encode req data use: {:?}", t.elapsed());
+        tracing::info!("    raw data size: {}, after compression: {}", data.len(), buff.len());
+
+        let t = Instant::now();
         let req = Request::builder()
         .method(Method::POST)
         .uri(format!("http://{}/auditplot", DST.deref()))
-        .body(Body::from(data))?;
+        .body(Body::from(buff))?;
 
         let resp = CLIENT.request(req).await?;
         let (parts, body) = resp.into_parts();
@@ -115,7 +128,10 @@ pub async fn call_audit_plot<'a, Plot>(
         }
 
         let body = hyper::body::aggregate(body).await?;
-        let reply: ReplyMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
+        let mut zlib_reader = ZlibDecoder::new(body.reader());
+
+        let reply: ReplyMsg = bincode::decode_from_std_read(&mut zlib_reader, bincode::config::standard())?;
+        tracing::info!("    call remote use: {:?}", t.elapsed());
 
         match reply {
             ReplyMsg::Out(out_list) => {
@@ -170,7 +186,8 @@ async fn audit_plot(
 
     let fut = async {
         let body = hyper::body::aggregate(req.into_body()).await?;
-        let req: ReqMsg = bincode::decode_from_std_read(&mut body.reader(), bincode::config::standard())?;
+        let mut zlib_reader = ZlibDecoder::new(body.reader());
+        let req: ReqMsg = bincode::decode_from_std_read(&mut zlib_reader, bincode::config::standard())?;
 
         let pk = PublicKey::from(req.public_key);
         let fake_plot = KeyWrap(req.key.clone());
@@ -232,7 +249,9 @@ async fn audit_plot(
         let reply = ReplyMsg::Out(audit_list);
 
         let out = bincode::encode_to_vec(reply, bincode::config::standard())?;
-        Result::<_, anyhow::Error>::Ok(Response::new(Body::from(out)))
+        let mut buff = Vec::new();
+        flate2::read::ZlibEncoder::new(&mut out.as_slice(), flate2::Compression::best()).read_to_end(&mut buff)?;
+        Result::<_, anyhow::Error>::Ok(Response::new(Body::from(buff)))
     };
 
     match fut.await {

@@ -266,7 +266,7 @@ where
         use subspace_farmer_components::auditing::audit_plot_sync_qiniu;
         use subspace_farmer_components::sector::RecordMetadata;
         use std::sync::LazyLock;
-        
+
         let PlotAuditOptions {
             public_key,
             reward_address,
@@ -282,6 +282,7 @@ where
         static IS_REMOTE_AUDIT: LazyLock<bool> = LazyLock::new(|| std::env::var("REMOTE_AUDIT").is_ok());
 
         let audit_results = if *IS_REMOTE_AUDIT {
+            let t = std::time::Instant::now();
             let res = remote_audit::call_audit_plot(
                 public_key, 
                 slot_info.global_challenge, 
@@ -290,6 +291,7 @@ where
                 sectors_metadata, 
                 maybe_sector_being_modified
             ).await;
+            tracing::info!("call remote audit plot use: {:?}", t.elapsed());
 
             match res {
                 Ok(v) => v,
