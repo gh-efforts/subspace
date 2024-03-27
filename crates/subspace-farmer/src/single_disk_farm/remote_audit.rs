@@ -162,6 +162,12 @@ async fn audit_plot(
         >
     > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
     let req_len = stream.read_u64().await? as usize;
+
+    // 100 MB
+    if req_len > 1024 * 1024 * 100 {
+        return Err(anyhow::anyhow!("bad request"));
+    }
+
     let mut req_buf = vec![0u8; req_len];
     stream.read_exact(&mut req_buf).await?;
     let req: ReqMsg = bincode::decode_from_slice(&req_buf, bincode::config::standard())?.0;
