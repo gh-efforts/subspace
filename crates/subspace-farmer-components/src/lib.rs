@@ -322,3 +322,21 @@ pub struct FarmerProtocolInfo {
     /// Minimum lifetime of a plotted sector, measured in archived segment
     pub min_sector_lifetime: HistorySize,
 }
+
+pub fn batch_read_with_ranges(
+    key: &str,
+    // (start position, length)
+    ranges: &[(u64, u64)],
+) -> std::io::Result<Vec<batch_access::Chunk>> {
+    let mut chunks = ranges.iter()
+    .map(|(i, len)| {
+       batch_access::Chunk {
+            pos: (*i) as usize,
+            data: Vec::with_capacity((*len) as usize)
+       } 
+    })
+    .collect::<Vec<_>>();
+
+    batch_access::current_par_batch_read(key, &mut chunks, 1024)?;
+    Ok(chunks)
+}

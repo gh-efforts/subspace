@@ -46,6 +46,7 @@ impl RayonFiles<File> {
     /// Open file at specified path as many times as there is number of threads in current [`rayon`]
     /// thread pool.
     pub fn open(path: &Path) -> io::Result<Self> {
+        let key;
         let files = if std::env::var("RANDRW_S3_SERVER").is_err() {
             let files = (0..rayon::current_num_threads())
                 .map(|_| {
@@ -58,12 +59,13 @@ impl RayonFiles<File> {
                     Ok::<_, io::Error>(file)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            key = path.to_str().unwrap().to_string();
             Some(files)
         } else {
+            key = crate::convert_to_s3key(path);
             None
         };
 
-        let key = crate::convert_to_s3key(path);
         Ok(Self { files, key })
     }
 }
